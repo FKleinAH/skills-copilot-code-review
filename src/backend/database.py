@@ -2,14 +2,135 @@
 MongoDB database configuration and setup for Mergington High School API
 """
 
+import copy
+import os
 from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 from argon2 import PasswordHasher, exceptions as argon2_exceptions
 
-# Connect to MongoDB
-client = MongoClient('mongodb://localhost:27017/')
-db = client['mergington_high']
-activities_collection = db['activities']
-teachers_collection = db['teachers']
+
+class UpdateResult:
+    """Lightweight update result compatible with PyMongo usage in routers."""
+
+    def __init__(self, modified_count: int):
+        self.modified_count = modified_count
+
+
+class InMemoryCollection:
+    """Small in-memory collection for local development without MongoDB."""
+
+    def __init__(self):
+        self._documents = {}
+
+    def _extract(self, document, key):
+        current = document
+        for part in key.split("."):
+            if isinstance(current, dict):
+                current = current.get(part)
+            else:
+                return None
+        return current
+
+    def _matches(self, document, query):
+        for key, expected in query.items():
+            actual = self._extract(document, key)
+            if isinstance(expected, dict):
+                for operator, value in expected.items():
+                    if operator == "$in":
+                        if isinstance(actual, list):
+                            if not any(item in value for item in actual):
+                                return False
+                        elif actual not in value:
+                            return False
+                    elif operator == "$gte":
+                        if actual is None or actual < value:
+                            return False
+                    elif operator == "$lte":
+                        if actual is None or actual > value:
+                            return False
+                    else:
+                        return False
+            elif actual != expected:
+                return False
+        return True
+
+    def count_documents(self, query):
+        return sum(1 for _ in self.find(query))
+
+    def insert_one(self, document):
+        doc = copy.deepcopy(document)
+        self._documents[doc["_id"]] = doc
+        return None
+
+    def find(self, query):
+        for document in self._documents.values():
+            if self._matches(document, query):
+                yield copy.deepcopy(document)
+
+    def find_one(self, query):
+        for document in self.find(query):
+            return document
+        return None
+
+    def update_one(self, query, update):
+        for doc_id, document in self._documents.items():
+            if not self._matches(document, query):
+                continue
+
+            modified = False
+            if "$push" in update:
+                for field, value in update["$push"].items():
+                    current = self._extract(document, field)
+                    if isinstance(current, list):
+                        current.append(value)
+                        modified = True
+
+            if "$pull" in update:
+                for field, value in update["$pull"].items():
+                    current = self._extract(document, field)
+                    if isinstance(current, list) and value in current:
+                        current.remove(value)
+                        modified = True
+
+            self._documents[doc_id] = document
+            return UpdateResult(modified_count=1 if modified else 0)
+
+        return UpdateResult(modified_count=0)
+
+    def aggregate(self, pipeline):
+        if len(pipeline) != 3:
+            return []
+
+        unwind_stage, group_stage, sort_stage = pipeline
+        unwind_field = unwind_stage.get("$unwind", "").lstrip("$")
+        group_field = group_stage.get("$group", {}).get("_id", "").lstrip("$")
+        sort_field, sort_direction = next(iter(sort_stage.get("$sort", {}).items()))
+
+        if unwind_field != group_field or sort_field != "_id" or sort_direction != 1:
+            return []
+
+        unique_values = set()
+        for document in self._documents.values():
+            values = self._extract(document, unwind_field)
+            if isinstance(values, list):
+                unique_values.update(values)
+
+        return [{"_id": value} for value in sorted(unique_values)]
+
+
+def _build_collections():
+    """Build MongoDB collections or in-memory fallback collections."""
+    mongodb_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
+    try:
+        mongo_client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=2000)
+        mongo_client.admin.command("ping")
+        mongo_db = mongo_client["mergington_high"]
+        return mongo_client, mongo_db["activities"], mongo_db["teachers"]
+    except PyMongoError:
+        return None, InMemoryCollection(), InMemoryCollection()
+
+
+client, activities_collection, teachers_collection = _build_collections()
 
 # Methods
 
